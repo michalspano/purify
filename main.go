@@ -41,6 +41,8 @@ Examples:
   digitalize -paper white images/sample.pdf          # -> images/sample-bw.png
   digitalize -paper black -format pdf -o out/ *.pdf  # one PDF per input in out/
   digitalize -paper white -t 0.3 drawing.pdf         # ignore faint pencil marks
+  digitalize -paper white -transparent drawing.pdf   # black ink on transparent PNG
+  digitalize -paper white -transparent -invert d.pdf # white ink on transparent PNG
 
 PDF input needs ghostscript (gs) or poppler (pdftoppm) on PATH; poppler's
 pdfimages is used to detect the scan's native resolution.
@@ -50,11 +52,32 @@ slight compression noise.
 
 type config struct {
 	params
-	format  string
-	out     string
-	outDir  bool
-	dpi     int
-	inkHigh bool // ink is white (black paper)
+	style
+	format string
+	out    string
+	outDir bool
+	dpi    int
+}
+
+// style says how the ink mask (1 = ink, 0 = paper) is drawn.
+type style struct {
+	inkWhite    bool // #fff ink on #000 paper (else #000 on #fff)
+	transparent bool // paper is fully transparent (PNG only)
+}
+
+// white reports whether mask value v is drawn white.
+func (s style) white(v uint8) bool { return (v == 1) == s.inkWhite }
+
+// palette returns the colours of mask values 0 (paper) and 1 (ink).
+func (s style) palette() color.Palette {
+	ink, paper := color.Color(color.Black), color.Color(color.White)
+	if s.inkWhite {
+		ink, paper = paper, ink
+	}
+	if s.transparent {
+		paper = color.Transparent
+	}
+	return color.Palette{paper, ink}
 }
 
 type page struct {
@@ -72,6 +95,8 @@ func main() {
 	thr := fs.Float64("t", 0.2, "ink `threshold`: how much darker than the paper a stroke must be (0-1); lower keeps fainter lines")
 	dpi := fs.Int("dpi", 0, "PDF render resolution (default: the scan's native resolution)")
 	keepEdges := fs.Bool("keep-edges", false, "keep dark regions touching the image border (by default they are treated as scan artifacts)")
+	invert := fs.Bool("invert", false, "swap output colours: white ink on black, or black ink on white for -paper black")
+	transparent := fs.Bool("transparent", false, "make the background transparent, keeping only the ink (PNG only)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usageText)
 		fs.PrintDefaults()
@@ -88,16 +113,18 @@ func main() {
 		inputs, args = append(inputs, args[0]), args[1:]
 	}
 
-	cfg := config{params: params{scale: *scale, threshold: *thr, cleanEdges: !*keepEdges}, out: *out, dpi: *dpi}
+	cfg := config{params: params{scale: *scale, threshold: *thr, cleanEdges: !*keepEdges},
+		style: style{transparent: *transparent}, out: *out, dpi: *dpi}
 	switch strings.ToLower(*paper) {
 	case "white", "w":
 	case "black", "b":
-		cfg.invert, cfg.inkHigh = true, true
+		cfg.negative = true
 	case "":
 		die("missing -paper white|black (run with -h for help)")
 	default:
 		die("invalid -paper %q: use white or black", *paper)
 	}
+	cfg.inkWhite = cfg.negative != *invert // ink keeps its colour unless inverted
 	if len(inputs) == 0 {
 		fs.Usage()
 		os.Exit(2)
@@ -127,6 +154,9 @@ func main() {
 	case "png", "jpg", "pdf":
 	default:
 		die("unsupported output format %q: use png, jpg or pdf", cfg.format)
+	}
+	if cfg.transparent && cfg.format != "png" {
+		die("-transparent needs PNG output (got %s)", cfg.format)
 	}
 
 	failed := false
@@ -179,9 +209,9 @@ func run(in string, cfg config) error {
 			mask, w, h := binarize(pg.pix, pg.w, pg.h, cfg.params)
 			switch cfg.format {
 			case "pdf":
-				pdfPages[i] = encodePDFPage(mask, w, h, pg.dpi*float64(cfg.scale), cfg.inkHigh)
+				pdfPages[i] = encodePDFPage(mask, w, h, pg.dpi*float64(cfg.scale), cfg.style)
 			default:
-				errs[i] = writeImage(paths[i], cfg.format, mask, w, h, cfg.inkHigh)
+				errs[i] = writeImage(paths[i], cfg.format, mask, w, h, cfg.style)
 			}
 		}()
 	}
@@ -382,15 +412,7 @@ func readPGM(r *bufio.Reader) (page, error) {
 
 // ---- output ---------------------------------------------------------------
 
-// level returns 0 (black) or 1 (white) for a mask value.
-func level(ink uint8, inkHigh bool) uint8 {
-	if inkHigh {
-		return ink
-	}
-	return 1 - ink
-}
-
-func writeImage(path, format string, mask []uint8, w, h int, inkHigh bool) error {
+func writeImage(path, format string, mask []uint8, w, h int, st style) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -398,17 +420,15 @@ func writeImage(path, format string, mask []uint8, w, h int, inkHigh bool) error
 	bw := bufio.NewWriterSize(f, 1<<20)
 	rect := image.Rect(0, 0, w, h)
 	if format == "png" {
-		// A 2-colour palette makes Go write a compact 1-bit PNG.
-		img := &image.Paletted{Pix: make([]uint8, w*h), Stride: w, Rect: rect,
-			Palette: color.Palette{color.Gray{0}, color.Gray{255}}}
-		for i, v := range mask {
-			img.Pix[i] = level(v, inkHigh)
-		}
-		err = png.Encode(bw, img)
+		// Mask values index a 2-colour palette: Go writes a compact 1-bit PNG
+		// (with a tRNS chunk when the paper is transparent).
+		err = png.Encode(bw, &image.Paletted{Pix: mask, Stride: w, Rect: rect, Palette: st.palette()})
 	} else {
 		img := &image.Gray{Pix: make([]uint8, w*h), Stride: w, Rect: rect}
 		for i, v := range mask {
-			img.Pix[i] = 255 * level(v, inkHigh)
+			if st.white(v) {
+				img.Pix[i] = 255
+			}
 		}
 		err = jpeg.Encode(bw, img, &jpeg.Options{Quality: 100})
 	}
@@ -423,13 +443,13 @@ type pdfPage struct {
 
 // encodePDFPage packs the mask into a Flate-compressed 1-bit DeviceGray image.
 // The page keeps the physical size of the scan (dpi = output pixels per inch).
-func encodePDFPage(mask []uint8, w, h int, dpi float64, inkHigh bool) pdfPage {
+func encodePDFPage(mask []uint8, w, h int, dpi float64, st style) pdfPage {
 	stride := (w + 7) / 8
 	bits := make([]byte, stride*h)
 	for y := range h {
 		row := bits[y*stride:]
 		for x, v := range mask[y*w : y*w+w] {
-			if level(v, inkHigh) == 1 {
+			if st.white(v) {
 				row[x>>3] |= 0x80 >> (x & 7)
 			}
 		}

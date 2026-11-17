@@ -9,7 +9,7 @@ import (
 
 // params controls the binarization pipeline.
 type params struct {
-	invert     bool    // white ink on black paper: process the negative
+	negative   bool    // white ink on black paper: process the negative
 	scale      int     // supersampling factor (>1 gives smoother contours)
 	threshold  float64 // how much darker than the paper (0..1) a stroke must be
 	cleanEdges bool    // remove scan-border artifacts touching the image edge
@@ -24,7 +24,7 @@ func binarize(pix []uint8, w, h int, p params) (mask []uint8, W, H int) {
 	minDim := float64(min(w, h))
 	img := make([]float32, len(pix))
 	for i, v := range pix {
-		if p.invert {
+		if p.negative {
 			v = 255 - v
 		}
 		img[i] = float32(v)
