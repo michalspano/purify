@@ -43,11 +43,12 @@ Examples:
   digitalize -paper white -t 0.3 drawing.pdf         # ignore faint pencil marks
   digitalize -paper white -transparent drawing.pdf   # black ink on transparent PNG
   digitalize -paper white -transparent -invert d.pdf # white ink on transparent PNG
+  digitalize -paper white -format svg drawing.pdf    # smooth vector outlines
 
 PDF input needs ghostscript (gs) or poppler (pdftoppm) on PATH; poppler's
 pdfimages is used to detect the scan's native resolution.
 PNG and PDF output is exactly two-tone; JPEG is lossy, so stroke edges carry
-slight compression noise.
+slight compression noise. SVG traces the ink into smooth, scalable outlines.
 `
 
 type config struct {
@@ -62,7 +63,7 @@ type config struct {
 // style says how the ink mask (1 = ink, 0 = paper) is drawn.
 type style struct {
 	inkWhite    bool // #fff ink on #000 paper (else #000 on #fff)
-	transparent bool // paper is fully transparent (PNG only)
+	transparent bool // paper is fully transparent (PNG and SVG only)
 }
 
 // white reports whether mask value v is drawn white.
@@ -89,14 +90,14 @@ type page struct {
 func main() {
 	fs := flag.NewFlagSet("digitalize", flag.ExitOnError)
 	paper := fs.String("paper", "", "paper colour: `white` (black ink) or black (white ink); required")
-	format := fs.String("format", "", "output `format`: png, jpg or pdf (default: from -o extension, else png)")
+	format := fs.String("format", "", "output `format`: png, jpg, pdf or svg (default: from -o extension, else png)")
 	out := fs.String("o", "", "output `path`; a directory when there are several inputs (default: <input>-bw.<format>)")
 	scale := fs.Int("scale", 2, "supersampling `factor`; >1 gives smoother edges and a larger image")
 	thr := fs.Float64("t", 0.2, "ink `threshold`: how much darker than the paper a stroke must be (0-1); lower keeps fainter lines")
 	dpi := fs.Int("dpi", 0, "PDF render resolution (default: the scan's native resolution)")
 	keepEdges := fs.Bool("keep-edges", false, "keep dark regions touching the image border (by default they are treated as scan artifacts)")
 	invert := fs.Bool("invert", false, "swap output colours: white ink on black, or black ink on white for -paper black")
-	transparent := fs.Bool("transparent", false, "make the background transparent, keeping only the ink (PNG only)")
+	transparent := fs.Bool("transparent", false, "make the background transparent, keeping only the ink (PNG and SVG only)")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usageText)
 		fs.PrintDefaults()
@@ -151,12 +152,12 @@ func main() {
 		cfg.format = "png"
 	case "jpeg":
 		cfg.format = "jpg"
-	case "png", "jpg", "pdf":
+	case "png", "jpg", "pdf", "svg":
 	default:
-		die("unsupported output format %q: use png, jpg or pdf", cfg.format)
+		die("unsupported output format %q: use png, jpg, pdf or svg", cfg.format)
 	}
-	if cfg.transparent && cfg.format != "png" {
-		die("-transparent needs PNG output (got %s)", cfg.format)
+	if cfg.transparent && cfg.format != "png" && cfg.format != "svg" {
+		die("-transparent needs PNG or SVG output (got %s)", cfg.format)
 	}
 
 	failed := false
@@ -210,6 +211,8 @@ func run(in string, cfg config) error {
 			switch cfg.format {
 			case "pdf":
 				pdfPages[i] = encodePDFPage(mask, w, h, pg.dpi*float64(cfg.scale), cfg.style)
+			case "svg":
+				errs[i] = writeSVG(paths[i], mask, w, h, pg.dpi*float64(cfg.scale), cfg.style)
 			default:
 				errs[i] = writeImage(paths[i], cfg.format, mask, w, h, cfg.style)
 			}
